@@ -1,0 +1,366 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Team Risk Analysis System - Serverless Backend
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: python3.13
+    MemorySize: 512
+    Environment:
+      Variables:
+        TEAM_SIGNALS_TABLE: !Ref TeamSignalsTable
+        RISK_RECORDS_TABLE: !Ref RiskRecordsTable
+        SNAPSHOTS_BUCKET: !Ref SnapshotsBucket
+        BEDROCK_MODEL_ID: anthropic.claude-3-5-sonnet-20241022-v2:0
+        LOG_LEVEL: INFO
+    Layers:
+      - !Ref SharedCodeLayer
+
+Resources:
+  # Lambda Layer for Shared Code
+  SharedCodeLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: team-risk-analysis-shared
+      Description: Shared backend modules for Team Risk Analysis
+      ContentUri: backend/
+      CompatibleRuntimes:
+        - python3.13
+      RetentionPolicy: Retain
+    Metadata:
+      BuildMethod: python3.13
+
+  # DynamoDB Tables
+  TeamSignalsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: TeamSignals
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: team_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: team_id-timestamp-index
+          KeySchema:
+            - AttributeName: team_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  RiskRecordsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: RiskRecords
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: team_id
+          AttributeType: S
+        - AttributeName: detected_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: team_id-detected_at-index
+          KeySchema:
+            - AttributeName: team_id
+              KeyType: HASH
+            - AttributeName: detected_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # S3 Bucket for Snapshots
+  SnapshotsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'team-risk-snapshots-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldSnapshots
+            Status: Enabled
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Lambda Functions
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: TeamRiskAnalysis-Ingest
+      CodeUri: backend/lambdas/ingest/
+      Handler: handler.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TeamSignalsTable
+      Events:
+        IngestAPI:
+          Type: Api
+          Properties:
+            Path: /api/signals
+            Method: POST
+            RestApiId: !Ref ApiGateway
+
+  AnalyzeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: TeamRiskAnalysis-Analyze
+      CodeUri: backend/lambdas/analyze/
+      Handler: handler.handler
+      Timeout: 90
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TeamSignalsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RiskRecordsTable
+        - S3CrudPolicy:
+            BucketName: !Ref SnapshotsBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: 
+                - 'arn:aws:bedrock:*::foundation-model/*'
+                - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*'
+            - Effect: Allow
+              Action:
+                - aws-marketplace:ViewSubscriptions
+                - aws-marketplace:Subscribe
+              Resource: '*'
+      Events:
+        AnalyzeAPI:
+          Type: Api
+          Properties:
+            Path: /api/analyze
+            Method: POST
+            RestApiId: !Ref ApiGateway
+        ScheduledAnalysis:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+            Enabled: true
+
+  QueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: TeamRiskAnalysis-Query
+      CodeUri: backend/lambdas/query/
+      Handler: handler.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref RiskRecordsTable
+      Events:
+        QueryAPI:
+          Type: Api
+          Properties:
+            Path: /api/risks
+            Method: GET
+            RestApiId: !Ref ApiGateway
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: TeamRiskAnalysisAPI
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+        AllowOrigin: "'*'"
+
+  # CloudWatch Log Groups
+  IngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${IngestFunction}'
+      RetentionInDays: 30
+
+  AnalyzeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AnalyzeFunction}'
+      RetentionInDays: 30
+
+  QueryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${QueryFunction}'
+      RetentionInDays: 30
+
+  # CloudWatch Alarms
+  IngestErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: TeamRiskAnalysis-Ingest-Errors
+      AlarmDescription: Alert when Ingest Lambda error rate exceeds 5%
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestFunction
+      TreatMissingData: notBreaching
+
+  AnalyzeErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: TeamRiskAnalysis-Analyze-Errors
+      AlarmDescription: Alert when Analyze Lambda error rate exceeds 5%
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AnalyzeFunction
+      TreatMissingData: notBreaching
+
+  AnalyzeDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: TeamRiskAnalysis-Analyze-Duration
+      AlarmDescription: Alert when Analyze Lambda duration exceeds 30 seconds
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 30000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AnalyzeFunction
+      TreatMissingData: notBreaching
+
+  QueryErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: TeamRiskAnalysis-Query-Errors
+      AlarmDescription: Alert when Query Lambda error rate exceeds 5%
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref QueryFunction
+      TreatMissingData: notBreaching
+
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: TeamRiskAnalysis-DynamoDB-Throttles
+      AlarmDescription: Alert when DynamoDB throttling occurs
+      MetricName: UserErrors
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: TeamRiskAnalysis-API-5xxErrors
+      AlarmDescription: Alert when API Gateway 5xx error rate is high
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: TeamRiskAnalysisAPI
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+  
+  TeamSignalsTableName:
+    Description: DynamoDB table for team signals
+    Value: !Ref TeamSignalsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TeamSignalsTable'
+  
+  RiskRecordsTableName:
+    Description: DynamoDB table for risk records
+    Value: !Ref RiskRecordsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-RiskRecordsTable'
+  
+  SnapshotsBucketName:
+    Description: S3 bucket for historical snapshots
+    Value: !Ref SnapshotsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-SnapshotsBucket'
+  
+  IngestFunctionArn:
+    Description: ARN of the Ingest Lambda function
+    Value: !GetAtt IngestFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IngestFunctionArn'
+  
+  AnalyzeFunctionArn:
+    Description: ARN of the Analyze Lambda function
+    Value: !GetAtt AnalyzeFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AnalyzeFunctionArn'
+  
+  QueryFunctionArn:
+    Description: ARN of the Query Lambda function
+    Value: !GetAtt QueryFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QueryFunctionArn'
+  
+  SharedCodeLayerArn:
+    Description: ARN of the shared code Lambda layer
+    Value: !Ref SharedCodeLayer
+    Export:
+      Name: !Sub '${AWS::StackName}-SharedCodeLayer'
